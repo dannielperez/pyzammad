@@ -9,7 +9,7 @@ description = "Typed, timeout-bounded Python client for the Zammad REST API"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-authors = [{ name = "Daniel Perez" }]
+authors = [{ name = "Danniel Perez" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
