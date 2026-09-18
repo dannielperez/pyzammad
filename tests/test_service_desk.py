@@ -393,3 +393,45 @@ def test_writeback_reconciliation_requires_note_and_transition():
 def test_webhook_bounds_reject_before_signature_or_json(payload):
     with pytest.raises(ZammadTransportError, match="zammad_webhook_invalid"):
         verify_webhook(payload, {}, secret=_SIGNING_MATERIAL)
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        (
+            {
+                "uniqueos_site_url": "https://os.example.test/ops/sites/ed93dc7f-d127-46e9-bb1e-1b18c11c965a/"
+            },
+            "https://os.example.test/ops/sites/ed93dc7f-d127-46e9-bb1e-1b18c11c965a/",
+        ),
+        (
+            {
+                "uniqueos_site_id": "ed93dc7f-d127-46e9-bb1e-1b18c11c965a",
+                "uniqueos_site_url": "https://os.example.test/ops/sites/00000000-0000-0000-0000-000000000001/",
+            },
+            "ed93dc7f-d127-46e9-bb1e-1b18c11c965a",
+        ),
+        (
+            {
+                "uniqueos_site_id": "  ",
+                "uniqueos_site_url": " https://os.example.test/ops/sites/x/ ",
+            },
+            "https://os.example.test/ops/sites/x/",
+        ),
+        ({"uniqueos_site_id": None, "uniqueos_site_url": None}, ""),
+        ({"uniqueos_site_url": "https://os.example.test/" + "a" * 600}, ""),
+        ({"uniqueos_site_url": {"nested": "value"}}, ""),
+        ({}, ""),
+    ],
+)
+def test_site_reference_falls_back_to_the_legacy_site_url_field(fields, expected):
+    session = Mock()
+    session.request.return_value = _response({"id": 42, "number": "98033", **fields})
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=session,
+    )
+
+    assert client.get_ticket("42").site_reference == expected

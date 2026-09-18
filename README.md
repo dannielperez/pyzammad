@@ -46,3 +46,9 @@ The client never automatically retries mutations; callers retain their existing
 admission and ambiguity handling. This port does not grant new write permissions.
 UniqueOS must separately consume an owner-merged SDK pin before removing its legacy
 copy. All tests use synthetic data and mocked transports.
+
+`ZammadTicket.site_reference` is read from the `uniqueos_site_id` custom field when it
+is populated, and otherwise from the legacy `uniqueos_site_url` field, passed through
+unparsed (non-string values and values over 512 characters are dropped). The SDK does
+not decide which hosts are approved: the consumer validates the URL and resolves the
+identifier.
