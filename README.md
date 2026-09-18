@@ -47,8 +47,9 @@ admission and ambiguity handling. This port does not grant new write permissions
 UniqueOS must separately consume an owner-merged SDK pin before removing its legacy
 copy. All tests use synthetic data and mocked transports.
 
-`ZammadTicket.site_reference` is read from the `uniqueos_site_id` custom field when it
-is populated, and otherwise from the legacy `uniqueos_site_url` field, passed through
-unparsed (non-string values and values over 512 characters are dropped). The SDK does
-not decide which hosts are approved: the consumer validates the URL and resolves the
-identifier.
+Ticket responses expose the complete bounded provider JSON object through
+`ZammadTicket.fields` and `ZammadTicket.field(name, default)`. Zammad custom object
+attributes are returned at the top level, so consumers can read any fields they own
+without adding application-specific names to this SDK. Field contents are untrusted
+provider data: consumers remain responsible for type, length, URL-host, identifier,
+and authorization validation before using them.

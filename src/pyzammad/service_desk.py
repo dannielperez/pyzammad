@@ -20,9 +20,6 @@ import requests
 
 _MAX_RESPONSE_BYTES = 1 << 20
 _MAX_WEBHOOK_BYTES = 1 << 19
-_MAX_SITE_REFERENCE_LENGTH = 512
-# Preference order: the bare identifier, then the legacy canonical-URL field.
-_SITE_REFERENCE_FIELDS = ("uniqueos_site_id", "uniqueos_site_url")
 _RETRYABLE_STATUS_CODES = frozenset((408, 425, 429))
 _SAFE_METHODS = frozenset(("GET", "HEAD", "OPTIONS"))
 _HTTP_CLIENT_ERROR = 400
@@ -115,7 +112,12 @@ class ZammadTicket:
     owner_id: str
     organization_id: str
     updated_at: str
-    site_reference: str
+    fields: dict[str, Any]
+
+    def field(self, name: str, default: Any = None) -> Any:
+        """Return a provider field without assigning application semantics to it."""
+
+        return self.fields.get(name, default)
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,22 +148,6 @@ class ZammadWritebackReconciliation:
     correlation_id: str
 
 
-def _site_reference(payload: dict[str, Any]) -> str:
-    """Return the consumer's site reference from the ticket's custom fields.
-
-    ``uniqueos_site_id`` (a bare identifier) wins when populated. Live desks that
-    predate it carry ``uniqueos_site_url`` instead; that string is passed through
-    unparsed so the consumer can validate the host it approves and resolve the
-    identifier itself. Oversized or non-string values are dropped.
-    """
-
-    for field in _SITE_REFERENCE_FIELDS:
-        value = payload.get(field)
-        if isinstance(value, str) and (value := value.strip()):
-            return value if len(value) <= _MAX_SITE_REFERENCE_LENGTH else ""
-    return ""
-
-
 def _parse_ticket(payload: dict[str, Any]) -> ZammadTicket:
     external_id = payload.get("id")
     if external_id is None:
@@ -180,7 +166,11 @@ def _parse_ticket(payload: dict[str, Any]) -> ZammadTicket:
         owner_id=str(payload.get("owner_id", "") or ""),
         organization_id=str(payload.get("organization_id", "") or ""),
         updated_at=str(payload.get("updated_at", "")),
-        site_reference=_site_reference(payload),
+        # Zammad returns custom object attributes alongside its built-in fields.
+        # Preserve the bounded JSON object so each consumer can interpret the
+        # attributes it owns without teaching this public SDK product-specific
+        # field names or trust rules.
+        fields=dict(payload),
     )
 
 
