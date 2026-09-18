@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,7 @@ _WEBHOOK_INVALID = "zammad_webhook_invalid"
 _WEBHOOK_JSON_INVALID = "zammad_webhook_json_invalid"
 _WEBHOOK_SIGNATURE_INVALID = "zammad_webhook_signature_invalid"
 _PRIORITY_NAMES = {1: "low", 2: "normal", 3: "high"}
+_CORRELATION_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 
 
 class ZammadTransportError(RuntimeError):
@@ -89,6 +91,14 @@ class ZammadArticleCreate:
 
 
 @dataclass(frozen=True, slots=True)
+class ZammadTicketWriteback:
+    body: str
+    internal: bool
+    status: str
+    correlation_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ZammadTicket:
     external_id: str
     number: str
@@ -98,6 +108,20 @@ class ZammadTicket:
     customer_id: str
     organization_id: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ZammadWritebackReceipt:
+    ticket: ZammadTicket
+    correlation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ZammadWritebackReconciliation:
+    ticket: ZammadTicket
+    note_found: bool
+    transition_applied: bool
+    correlation_id: str
 
 
 def _parse_ticket(payload: dict[str, Any]) -> ZammadTicket:
@@ -180,7 +204,7 @@ def _read_bounded(response: requests.Response) -> bytearray:
     return raw
 
 
-def _parse_response(response: requests.Response) -> dict[str, Any]:
+def _parse_response_value(response: requests.Response) -> Any:
     if response.status_code in _RETRYABLE_STATUS_CODES:
         raise _error(_RATE_LIMITED, retryable=True, ambiguous=False)
     if response.status_code >= _HTTP_SERVER_ERROR:
@@ -196,9 +220,20 @@ def _parse_response(response: requests.Response) -> dict[str, Any]:
             retryable=False,
             ambiguous=True,
         ) from None
+    return parsed
+
+
+def _parse_response(response: requests.Response) -> dict[str, Any]:
+    parsed = _parse_response_value(response)
     if not isinstance(parsed, dict):
         raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
     return parsed
+
+
+def _correlation_marker(correlation_id: str) -> str:
+    if not _CORRELATION_ID.fullmatch(correlation_id):
+        raise _error(_CONFIGURATION_INVALID, retryable=False, ambiguous=False)
+    return f"[UniqueOS correlation: {correlation_id}]"
 
 
 def _connection_failure(method: str) -> ZammadTransportError:
@@ -267,6 +302,30 @@ class ZammadClient:
         finally:
             response.close()
 
+    def _request_value(self, method: str, path: str) -> Any:
+        try:
+            response = self._session.request(
+                method,
+                f"{self.base_url}{path}",
+                headers=self._headers,
+                json=None,
+                timeout=self.timeout,
+                stream=True,
+            )
+        except requests.ConnectTimeout:
+            raise _error(_CONNECT_TIMEOUT, retryable=True, ambiguous=False) from None
+        except (requests.ReadTimeout, requests.ConnectionError):
+            raise _connection_failure(method) from None
+        except requests.RequestException:
+            raise _error(_TRANSPORT_FAILED, retryable=False, ambiguous=True) from None
+        try:
+            try:
+                return _parse_response_value(response)
+            except requests.RequestException:
+                raise _connection_failure(method) from None
+        finally:
+            response.close()
+
     def create_ticket(self, command: ZammadTicketCreate) -> ZammadTicket:
         payload = {
             "title": command.title,
@@ -316,3 +375,48 @@ class ZammadClient:
         if article_id is None:
             raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
         return str(article_id)
+
+    def writeback_ticket(
+        self,
+        external_id: str,
+        command: ZammadTicketWriteback,
+    ) -> ZammadWritebackReceipt:
+        """Append one correlated note and state change in one provider request."""
+        marker = _correlation_marker(command.correlation_id)
+        payload = {
+            "state": command.status,
+            "article": {
+                "subject": "UniqueOS work update",
+                "body": f"{command.body}\n\n{marker}",
+                "type": "note",
+                "internal": command.internal,
+            },
+        }
+        ticket = _parse_ticket(
+            self._request("PUT", f"/api/v1/tickets/{external_id}", body=payload),
+        )
+        return ZammadWritebackReceipt(ticket, command.correlation_id)
+
+    def reconcile_writeback(
+        self,
+        external_id: str,
+        command: ZammadTicketWriteback,
+    ) -> ZammadWritebackReconciliation:
+        """Read back both effects of an ambiguously acknowledged write."""
+        marker = _correlation_marker(command.correlation_id)
+        ticket = self.get_ticket(external_id)
+        articles = self._request_value(
+            "GET",
+            f"/api/v1/ticket_articles/by_ticket/{external_id}",
+        )
+        if not isinstance(articles, list) or any(
+            not isinstance(article, dict) for article in articles
+        ):
+            raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
+        note_found = any(marker in str(article.get("body", "")) for article in articles)
+        return ZammadWritebackReconciliation(
+            ticket=ticket,
+            note_found=note_found,
+            transition_applied=ticket.status == command.status,
+            correlation_id=command.correlation_id,
+        )
