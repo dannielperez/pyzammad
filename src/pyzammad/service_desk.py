@@ -14,6 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -31,6 +32,8 @@ _RATE_LIMITED = "zammad_rate_limited"
 _REJECTED = "zammad_rejected"
 _RESPONSE_INVALID = "zammad_response_invalid"
 _RESPONSE_TOO_LARGE = "zammad_response_too_large"
+_TICKET_AMBIGUOUS = "zammad_ticket_ambiguous"
+_TICKET_NOT_FOUND = "zammad_ticket_not_found"
 _TRANSPORT_FAILED = "zammad_transport_failed"
 _WEBHOOK_INVALID = "zammad_webhook_invalid"
 _WEBHOOK_JSON_INVALID = "zammad_webhook_json_invalid"
@@ -106,8 +109,24 @@ class ZammadTicket:
     status: str
     priority: str
     customer_id: str
+    owner_id: str
     organization_id: str
     updated_at: str
+    site_reference: str
+
+
+@dataclass(frozen=True, slots=True)
+class ZammadUser:
+    external_id: str
+    login: str
+    email: str
+    firstname: str
+    lastname: str
+    active: bool
+
+    @property
+    def display_name(self) -> str:
+        return " ".join(part for part in (self.firstname, self.lastname) if part).strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,8 +158,24 @@ def _parse_ticket(payload: dict[str, Any]) -> ZammadTicket:
         status=str(payload.get("state", payload.get("state_id", ""))),
         priority=str(priority),
         customer_id=str(payload.get("customer_id", "")),
+        owner_id=str(payload.get("owner_id", "") or ""),
         organization_id=str(payload.get("organization_id", "") or ""),
         updated_at=str(payload.get("updated_at", "")),
+        site_reference=str(payload.get("uniqueos_site_id", "") or ""),
+    )
+
+
+def _parse_user(payload: dict[str, Any]) -> ZammadUser:
+    external_id = payload.get("id")
+    if external_id is None:
+        raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
+    return ZammadUser(
+        external_id=str(external_id),
+        login=str(payload.get("login", "") or ""),
+        email=str(payload.get("email", "") or ""),
+        firstname=str(payload.get("firstname", "") or ""),
+        lastname=str(payload.get("lastname", "") or ""),
+        active=bool(payload.get("active", False)),
     )
 
 
@@ -223,9 +258,9 @@ def _parse_response_value(response: requests.Response) -> Any:
     return parsed
 
 
-def _parse_response(response: requests.Response) -> dict[str, Any]:
+def _parse_response(response: requests.Response) -> dict[str, Any] | list[Any]:
     parsed = _parse_response_value(response)
-    if not isinstance(parsed, dict):
+    if not isinstance(parsed, (dict, list)):
         raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
     return parsed
 
@@ -234,6 +269,12 @@ def _correlation_marker(correlation_id: str) -> str:
     if not _CORRELATION_ID.fullmatch(correlation_id):
         raise _error(_CONFIGURATION_INVALID, retryable=False, ambiguous=False)
     return f"[UniqueOS correlation: {correlation_id}]"
+
+
+def _object(payload: dict[str, Any] | list[Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
+    return payload
 
 
 def _connection_failure(method: str) -> ZammadTransportError:
@@ -275,7 +316,7 @@ class ZammadClient:
         path: str,
         *,
         body: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | list[Any]:
         try:
             response = self._session.request(
                 method,
@@ -340,10 +381,35 @@ class ZammadClient:
             },
             **command.custom_fields,
         }
-        return _parse_ticket(self._request("POST", "/api/v1/tickets", body=payload))
+        return _parse_ticket(_object(self._request("POST", "/api/v1/tickets", body=payload)))
 
     def get_ticket(self, external_id: str) -> ZammadTicket:
-        return _parse_ticket(self._request("GET", f"/api/v1/tickets/{external_id}"))
+        payload = self._request("GET", f"/api/v1/tickets/{external_id}")
+        return _parse_ticket(_object(payload))
+
+    def find_ticket_by_number(self, number: str) -> ZammadTicket:
+        clean_number = str(number).strip()
+        if not clean_number:
+            raise _error(_CONFIGURATION_INVALID, retryable=False, ambiguous=False)
+        query = quote(f"number:{clean_number}", safe="")
+        payload = self._request("GET", f"/api/v1/tickets/search?query={query}")
+        if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+            raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)
+        matches = [
+            _parse_ticket(item) for item in payload if str(item.get("number", "")) == clean_number
+        ]
+        if not matches:
+            raise _error(_TICKET_NOT_FOUND, retryable=False, ambiguous=False)
+        if len(matches) != 1:
+            raise _error(_TICKET_AMBIGUOUS, retryable=False, ambiguous=False)
+        return matches[0]
+
+    def get_user(self, external_id: str) -> ZammadUser:
+        payload = self._request("GET", f"/api/v1/users/{external_id}")
+        return _parse_user(_object(payload))
+
+    def ticket_url(self, number: str) -> str:
+        return f"{self.base_url}/ticket/{quote(str(number), safe='')}"
 
     def update_ticket(
         self,
@@ -356,7 +422,9 @@ class ZammadClient:
         if command.priority is not None:
             payload["priority"] = command.priority
         return _parse_ticket(
-            self._request("PUT", f"/api/v1/tickets/{external_id}", body=payload),
+            _object(
+                self._request("PUT", f"/api/v1/tickets/{external_id}", body=payload),
+            ),
         )
 
     def create_article(
@@ -370,7 +438,9 @@ class ZammadClient:
             "type": "note",
             "internal": command.internal,
         }
-        result = self._request("POST", "/api/v1/ticket_articles", body=payload)
+        result = _object(
+            self._request("POST", "/api/v1/ticket_articles", body=payload),
+        )
         article_id = result.get("id")
         if article_id is None:
             raise _error(_RESPONSE_INVALID, retryable=False, ambiguous=True)

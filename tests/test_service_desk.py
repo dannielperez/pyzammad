@@ -23,7 +23,7 @@ _CREDENTIAL = "opaque-fixture-credential"
 _SIGNING_MATERIAL = "opaque-fixture-signing-material"
 
 
-def _response(payload: dict, *, status_code: int = 200) -> Mock:
+def _response(payload: dict | list, *, status_code: int = 200) -> Mock:
     response = Mock()
     response.status_code = status_code
     response.content = json.dumps(payload).encode()
@@ -127,6 +127,96 @@ def test_connection_failure_is_retryable_for_get_but_ambiguous_for_write():
     assert read_error.value.ambiguous is False
     assert write_error.value.retryable is False
     assert write_error.value.ambiguous is True
+
+
+def test_ticket_and_user_identity_fields_are_typed():
+    session = Mock()
+    session.request.side_effect = [
+        _response(
+            {
+                "id": 42,
+                "number": "74002",
+                "title": "Camera offline",
+                "state": "open",
+                "priority": "2 normal",
+                "customer_id": 7,
+                "owner_id": 3,
+                "organization_id": 9,
+                "uniqueos_site_id": "ed93dc7f-d127-46e9-bb1e-1b18c11c965a",
+                "updated_at": "2026-09-18T12:00:00Z",
+            },
+        ),
+        _response(
+            {
+                "id": 3,
+                "login": "agent@example.test",
+                "email": "agent@example.test",
+                "firstname": "Ada",
+                "lastname": "Lovelace",
+                "active": True,
+            },
+        ),
+    ]
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=session,
+    )
+
+    ticket = client.get_ticket("42")
+    user = client.get_user(ticket.owner_id)
+
+    assert ticket.owner_id == "3"
+    assert ticket.site_reference == "ed93dc7f-d127-46e9-bb1e-1b18c11c965a"
+    assert user.external_id == "3"
+    assert user.email == "agent@example.test"
+    assert user.display_name == "Ada Lovelace"
+    assert client.ticket_url(ticket.number) == "https://desk.example.test/ticket/74002"
+
+
+def test_ticket_number_lookup_requires_one_exact_match():
+    session = Mock()
+    session.request.return_value = _response(
+        [
+            {"id": 41, "number": "74001", "title": "Other"},
+            {"id": 42, "number": "74002", "title": "Camera offline"},
+        ],
+    )
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=session,
+    )
+
+    ticket = client.find_ticket_by_number("74002")
+
+    assert ticket.external_id == "42"
+    assert session.request.call_args.args[1].endswith(
+        "/api/v1/tickets/search?query=number%3A74002",
+    )
+
+
+def test_ticket_number_lookup_rejects_missing_or_duplicate_exact_matches():
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=Mock(),
+    )
+    client._session.request.return_value = _response([])  # noqa: SLF001
+    with pytest.raises(ZammadTransportError, match="ticket_not_found"):
+        client.find_ticket_by_number("74002")
+
+    client._session.request.return_value = _response(  # noqa: SLF001
+        [
+            {"id": 42, "number": "74002"},
+            {"id": 43, "number": "74002"},
+        ],
+    )
+    with pytest.raises(ZammadTransportError, match="ticket_ambiguous"):
+        client.find_ticket_by_number("74002")
 
 
 def test_declared_oversized_response_is_rejected_before_streaming():
