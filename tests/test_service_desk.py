@@ -9,10 +9,12 @@ from unittest.mock import Mock
 
 import pytest
 import requests
+
 from pyzammad.service_desk import (
     ZammadClient,
     ZammadTicketCreate,
     ZammadTicketUpdate,
+    ZammadTicketWriteback,
     ZammadTransportError,
     verify_webhook,
 )
@@ -224,6 +226,77 @@ def test_actual_stream_limit_closes_response_without_declared_size():
     with pytest.raises(ZammadTransportError, match="response_too_large"):
         client.get_ticket("42")
     response.close.assert_called_once_with()
+
+
+def test_correlated_writeback_uses_one_ticket_mutation():
+    session = Mock()
+    session.request.return_value = _response(
+        {
+            "id": 42,
+            "number": "74002",
+            "title": "Camera offline",
+            "state": "closed",
+            "priority": "high",
+            "customer_id": 7,
+        },
+    )
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=session,
+    )
+
+    receipt = client.writeback_ticket(
+        "42",
+        ZammadTicketWriteback(
+            body="Verification complete.",
+            internal=True,
+            status="closed",
+            correlation_id="corr-123",
+        ),
+    )
+
+    assert receipt.ticket.status == "closed"
+    assert receipt.correlation_id == "corr-123"
+    assert session.request.call_args.kwargs["json"] == {
+        "state": "closed",
+        "article": {
+            "subject": "UniqueOS work update",
+            "body": "Verification complete.\n\n[UniqueOS correlation: corr-123]",
+            "type": "note",
+            "internal": True,
+        },
+    }
+
+
+def test_writeback_reconciliation_requires_note_and_transition():
+    session = Mock()
+    articles = _response(
+        {
+            "ignored": "the list response is supplied below",
+        },
+    )
+    session.request.side_effect = [
+        _response({"id": 42, "state": "closed"}),
+        articles,
+    ]
+    articles.iter_content.return_value = [
+        json.dumps([{"id": 8, "body": "[UniqueOS correlation: corr-123]"}]).encode(),
+    ]
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=session,
+    )
+    command = ZammadTicketWriteback("unused", False, "closed", "corr-123")
+
+    result = client.reconcile_writeback("42", command)
+
+    assert result.note_found is True
+    assert result.transition_applied is True
+    assert session.request.call_count == 2
 
 
 @pytest.mark.parametrize("payload", [b"", b"x" * ((1 << 19) + 1)])
