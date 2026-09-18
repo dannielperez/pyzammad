@@ -112,7 +112,12 @@ class ZammadTicket:
     owner_id: str
     organization_id: str
     updated_at: str
-    site_reference: str
+    fields: dict[str, Any]
+
+    def field(self, name: str, default: Any = None) -> Any:
+        """Return a provider field without assigning application semantics to it."""
+
+        return self.fields.get(name, default)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +166,11 @@ def _parse_ticket(payload: dict[str, Any]) -> ZammadTicket:
         owner_id=str(payload.get("owner_id", "") or ""),
         organization_id=str(payload.get("organization_id", "") or ""),
         updated_at=str(payload.get("updated_at", "")),
-        site_reference=str(payload.get("uniqueos_site_id", "") or ""),
+        # Zammad returns custom object attributes alongside its built-in fields.
+        # Preserve the bounded JSON object so each consumer can interpret the
+        # attributes it owns without teaching this public SDK product-specific
+        # field names or trust rules.
+        fields=dict(payload),
     )
 
 

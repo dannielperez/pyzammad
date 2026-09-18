@@ -142,7 +142,10 @@ def test_ticket_and_user_identity_fields_are_typed():
                 "customer_id": 7,
                 "owner_id": 3,
                 "organization_id": 9,
-                "uniqueos_site_id": "ed93dc7f-d127-46e9-bb1e-1b18c11c965a",
+                "asset_record": {
+                    "id": "ed93dc7f-d127-46e9-bb1e-1b18c11c965a",
+                    "source": "inventory",
+                },
                 "updated_at": "2026-09-18T12:00:00Z",
             },
         ),
@@ -168,7 +171,11 @@ def test_ticket_and_user_identity_fields_are_typed():
     user = client.get_user(ticket.owner_id)
 
     assert ticket.owner_id == "3"
-    assert ticket.site_reference == "ed93dc7f-d127-46e9-bb1e-1b18c11c965a"
+    assert ticket.field("asset_record") == {
+        "id": "ed93dc7f-d127-46e9-bb1e-1b18c11c965a",
+        "source": "inventory",
+    }
+    assert ticket.field("not_configured", "fallback") == "fallback"
     assert user.external_id == "3"
     assert user.email == "agent@example.test"
     assert user.display_name == "Ada Lovelace"
@@ -393,3 +400,32 @@ def test_writeback_reconciliation_requires_note_and_transition():
 def test_webhook_bounds_reject_before_signature_or_json(payload):
     with pytest.raises(ZammadTransportError, match="zammad_webhook_invalid"):
         verify_webhook(payload, {}, secret=_SIGNING_MATERIAL)
+
+
+def test_ticket_preserves_arbitrary_json_fields_for_consumer_interpretation():
+    provider_fields = {
+        "service_site_url": "https://inventory.example.test/sites/42/",
+        "asset_metadata": {
+            "serials": ["A-1", "B-2"],
+            "verified": True,
+            "replacement_cost": 12.5,
+        },
+        "nullable_attribute": None,
+    }
+    session = Mock()
+    session.request.return_value = _response(
+        {"id": 42, "number": "98033", **provider_fields},
+    )
+    client = ZammadClient(
+        base_url="https://desk.example.test",
+        api_token=_CREDENTIAL,
+        timeout=(2, 8),
+        session=session,
+    )
+
+    ticket = client.get_ticket("42")
+
+    assert ticket.field("service_site_url") == provider_fields["service_site_url"]
+    assert ticket.field("asset_metadata") == provider_fields["asset_metadata"]
+    assert ticket.field("nullable_attribute", "fallback") is None
+    assert ticket.fields["number"] == "98033"
